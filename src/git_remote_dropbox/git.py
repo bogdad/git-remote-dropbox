@@ -1,10 +1,82 @@
+import hashlib
+import os
 import subprocess
+import threading
 import zlib
-from typing import List, Optional
+from functools import lru_cache
+from typing import List, Optional, Tuple
 
 from git_remote_dropbox.constants import DEVNULL
+from git_remote_dropbox.util import atomic_write
 
 EMPTY_TREE_HASH: str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+
+
+class _CatFile:
+    """
+    A persistent `git cat-file --batch` (or `--batch-check`) process.
+
+    Spawning a git subprocess per object dominates the runtime when
+    pushing/fetching many objects; a single batch process serves all requests
+    over a pipe instead. Instances are not thread-safe: use one per thread
+    (see `_cat_file` / `_cat_file_check`).
+    """
+
+    def __init__(self, *, check: bool) -> None:
+        flag = "--batch-check" if check else "--batch"
+        proc = subprocess.Popen(
+            ["git", "cat-file", flag],  # noqa: S607
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=DEVNULL,
+        )
+        if proc.stdin is None or proc.stdout is None:
+            msg = "failed to open pipes to git cat-file"
+            raise RuntimeError(msg)
+        self._stdin = proc.stdin
+        self._stdout = proc.stdout
+        self._check = check
+
+    def query(self, sha: str) -> Optional[Tuple[str, bytes]]:
+        """
+        Return (kind, contents) for the given object, or None if it is missing.
+
+        In check mode, contents is always b"".
+        """
+        self._stdin.write(sha.encode("utf8") + b"\n")
+        self._stdin.flush()
+        header = self._stdout.readline().split()
+        try:
+            _, kind_bytes, size_bytes = header
+        except ValueError:
+            # "<sha> missing" (or "<sha> ambiguous")
+            return None
+        kind = kind_bytes.decode("utf8")
+        size = int(size_bytes)
+        if self._check:
+            return (kind, b"")
+        contents = self._stdout.read(size)
+        self._stdout.readline()  # trailing newline after the contents
+        return (kind, contents)
+
+
+_per_thread = threading.local()
+
+
+def _cat_file() -> _CatFile:
+    proc: Optional[_CatFile] = getattr(_per_thread, "cat_file", None)
+    if proc is None:
+        proc = _CatFile(check=False)
+        _per_thread.cat_file = proc
+    return proc
+
+
+def _cat_file_check() -> _CatFile:
+    proc: Optional[_CatFile] = getattr(_per_thread, "cat_file_check", None)
+    if proc is None:
+        proc = _CatFile(check=True)
+        _per_thread.cat_file_check = proc
+    return proc
 
 
 def command_output_raw(*args: str) -> bytes:
@@ -43,7 +115,7 @@ def object_exists(sha: str) -> bool:
     """
     Return whether the object exists in the repository.
     """
-    return command_ok("cat-file", "-e", sha)
+    return _cat_file_check().query(sha) is not None
 
 
 def history_exists(sha: str) -> bool:
@@ -68,24 +140,6 @@ def symbolic_ref_value(name: str) -> str:
     return command_output("symbolic-ref", name)
 
 
-def object_kind(sha: str) -> str:
-    """
-    Return the type of the object.
-    """
-    return command_output("cat-file", "-t", sha)
-
-
-def object_data(sha: str, kind: Optional[str] = None) -> bytes:
-    """
-    Return the contents of the object.
-
-    If kind is None, return a pretty-printed representation of the object.
-    """
-    if kind is not None:
-        return command_output_raw("cat-file", kind, sha)
-    return command_output_raw("cat-file", "-p", sha)
-
-
 def encode_object(sha: str) -> bytes:
     """
     Return the encoded contents of the object.
@@ -94,23 +148,49 @@ def encode_object(sha: str) -> bytes:
 
     This operation is the inverse of `decode_object`.
     """
-    kind = object_kind(sha)
-    size = command_output("cat-file", "-s", sha)
-    contents = object_data(sha, kind)
-    data = kind.encode("utf8") + b" " + size.encode("utf8") + b"\0" + contents
+    res = _cat_file().query(sha)
+    if res is None:
+        msg = f"object not found: {sha}"
+        raise ValueError(msg)
+    kind, contents = res
+    data = kind.encode("utf8") + b" " + str(len(contents)).encode("utf8") + b"\0" + contents
     return zlib.compress(data)
 
 
-def decode_object(data: bytes) -> str:
+def decode_object(data: bytes) -> Tuple[str, str, bytes]:
     """
-    Decode the object, write it, and return the computed hash.
+    Decode an encoded object without writing it.
+
+    Return a tuple (computed sha, kind, contents).
 
     This operation is the inverse of `encode_object`.
     """
     decompressed = zlib.decompress(data)
+    sha = hashlib.sha1(decompressed).hexdigest()  # noqa: S324
     header, contents = decompressed.split(b"\0", 1)
-    kind = header.split()[0]
-    return write_object(kind.decode("utf8"), contents)
+    kind = header.split()[0].decode("utf8")
+    return (sha, kind, contents)
+
+
+@lru_cache(maxsize=None)
+def _objects_dir() -> str:
+    return command_output("rev-parse", "--git-path", "objects")
+
+
+def write_loose_object(sha: str, data: bytes) -> None:
+    """
+    Write an encoded object (as produced by `encode_object`) directly into the
+    object store as a loose object.
+
+    The caller is responsible for verifying that sha matches the data (see
+    `decode_object`).
+    """
+    path = os.path.join(_objects_dir(), sha[:2], sha[2:])
+    if os.path.exists(path):
+        # objects are content-addressed, so an existing object needs no update
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    atomic_write(data, path)
 
 
 def write_object(kind: str, contents: bytes) -> str:
@@ -140,35 +220,54 @@ def referenced_objects(sha: str) -> List[str]:
     """
     Return the objects directly referenced by the object.
     """
-    kind = object_kind(sha)
+    res = _cat_file().query(sha)
+    if res is None:
+        msg = f"object not found: {sha}"
+        raise ValueError(msg)
+    kind, contents = res
+    return referenced_objects_from_data(kind, contents)
+
+
+def referenced_objects_from_data(kind: str, contents: bytes) -> List[str]:
+    """
+    Return the objects directly referenced by an object, given its raw
+    contents (as returned by `decode_object`).
+    """
     if kind == "blob":
         # blob objects do not reference any other objects
         return []
-    data = object_data(sha).decode("utf8").strip()
     if kind == "tag":
-        # tag objects reference a single object
-        obj = data.split("\n", maxsplit=1)[0].split()[1]
-        return [obj]
+        # tag objects reference a single object: the first header line is
+        # "object <sha>"
+        return [contents.split(b"\n", maxsplit=1)[0].split()[1].decode("utf8")]
     if kind == "commit":
         # commit objects reference a tree and zero or more parents
-        lines = data.split("\n")
-        tree = lines[0].split()[1]
-        objs = [tree]
-        for line in lines[1:]:
-            if line.startswith("parent "):
-                objs.append(line.split()[1])
-            else:
+        objs = []
+        for line in contents.split(b"\n"):
+            if line.startswith((b"tree ", b"parent ")):
+                objs.append(line.split()[1].decode("utf8"))
+            elif not line.startswith(b" "):
+                # end of the tree/parent headers (which always come first);
+                # lines starting with a space are continuations of multi-line
+                # headers such as gpgsig
                 break
         return objs
     if kind == "tree":
-        # tree objects reference zero or more trees and blobs, or submodules
-        if not data:
-            # empty tree
-            return []
-        lines = data.split("\n")
-        # submodules have the mode '160000' and the kind 'commit', we filter them out because
-        # there is nothing to download and this causes errors
-        return [line.split()[2] for line in lines if not line.startswith("160000 commit ")]
+        # tree objects reference zero or more trees and blobs, or submodules;
+        # entries are "<mode> <name>\0" followed by a 20-byte binary sha
+        objs = []
+        i = 0
+        while i < len(contents):
+            mode_end = contents.index(b" ", i)
+            mode = contents[i:mode_end]
+            name_end = contents.index(b"\0", mode_end)
+            sha_end = name_end + 21
+            # submodules have the mode '160000', we filter them out because
+            # there is nothing to download and this causes errors
+            if mode != b"160000":
+                objs.append(contents[name_end + 1 : sha_end].hex())
+            i = sha_end
+        return objs
     msg = f"unexpected git object type: {kind}"
     raise ValueError(msg)
 

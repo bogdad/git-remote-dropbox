@@ -337,9 +337,15 @@ class Helper:
                     else:
                         raise
 
-    def _download(self, input_queue: "Queue[Union[str, Poison]]", output_queue: "Queue[Union[str, Poison]]") -> None:
+    def _download(
+        self,
+        input_queue: "Queue[Union[str, Poison]]",
+        output_queue: "Queue[Union[Tuple[str, List[str]], Poison]]",
+    ) -> None:
         """
         Download files given in input_queue and push results to output_queue.
+
+        Results are tuples of (sha, list of objects referenced by the object).
         """
         while True:
             try:
@@ -347,10 +353,12 @@ class Helper:
                 if isinstance(obj, Poison):
                     return
                 _, data = self._get_file(self._object_path(obj))
-                computed_sha = git.decode_object(data)
+                computed_sha, kind, contents = git.decode_object(data)
                 if computed_sha != obj:
                     output_queue.put(Poison(f"hash mismatch {computed_sha} != {obj}"))
-                output_queue.put(obj)
+                    continue
+                git.write_loose_object(obj, data)
+                output_queue.put((obj, git.referenced_objects_from_data(kind, contents)))
             except Exception as e:  # noqa: BLE001
                 output_queue.put(Poison(f"exception while downloading: {e}"))
 
@@ -363,7 +371,7 @@ class Helper:
         pending: Set[str] = set()
         downloaded: Set[str] = set()
         input_queue: Queue[Union[str, Poison]] = Queue()  # requesting downloads
-        output_queue: Queue[Union[str, Poison]] = Queue()  # completed downloads
+        output_queue: Queue[Union[Tuple[str, List[str]], Poison]] = Queue()  # completed downloads
         procs = []
         for _ in range(self._processes):
             target = Binder(self, "_download")
@@ -408,9 +416,10 @@ class Helper:
                         msg = "invalid Poison with no message"
                         raise ValueError(msg)
                     self._fatal(res.message)
-                pending.remove(res)
-                downloaded.add(res)
-                queue.extend(git.referenced_objects(res))
+                obj, referenced = res
+                pending.remove(obj)
+                downloaded.add(obj)
+                queue.extend(referenced)
                 # show progress
                 done = len(downloaded)
                 total = done + len(pending)
