@@ -5,7 +5,7 @@ import sys
 import tempfile
 from abc import ABC, abstractmethod
 from enum import IntEnum
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import dropbox  # type: ignore
 
@@ -272,6 +272,36 @@ class Config:
 
     def delete_named_token(self, name: str) -> None:
         self._named_tokens.pop(name, None)  # ignore nonexistent
+
+
+def find_dropbox_roots() -> List[str]:
+    """
+    Return the local filesystem paths of Dropbox sync folders, if any.
+
+    Reads the Dropbox desktop client's info.json, whose location is
+    system-dependent; see
+    https://help.dropbox.com/installs/locate-dropbox-folder
+    """
+    if sys.platform == "win32":
+        candidates = [
+            os.path.join(os.environ.get("APPDATA", ""), "Dropbox", "info.json"),
+            os.path.join(os.environ.get("LOCALAPPDATA", ""), "Dropbox", "info.json"),
+        ]
+    else:
+        candidates = [os.path.expanduser("~/.dropbox/info.json")]
+    roots = []
+    for candidate in candidates:
+        try:
+            with open(candidate) as f:
+                info = json.load(f)
+        except (OSError, ValueError):
+            continue
+        # one entry per linked account, e.g. "personal" and "business"
+        for account in info.values():
+            path = account.get("path") if isinstance(account, dict) else None
+            if path and os.path.isdir(path):
+                roots.append(path)
+    return roots
 
 
 def atomic_write(contents: bytes, path: str) -> None:

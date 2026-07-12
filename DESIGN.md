@@ -120,6 +120,21 @@ refs before listing objects, and a push uploads all objects before updating a
 ref, so the listing is a superset of the objects reachable from the refs
 being fetched.
 
+### Local Dropbox folder
+
+If the Dropbox desktop client syncs the repository folder on this machine,
+objects are read from the local folder instead of being downloaded via the
+API, falling back to the API when a file is absent. This is safe because
+objects are immutable and content-addressed, and every local read is verified
+against its hash: a stale local folder only means some objects are not there
+yet, and a wrong or corrupt local file is discarded in favor of the API. Refs
+are never read from or written to the local folder — they are mutable, the
+folder can lag behind the server, and ref updates depend on the API's atomic
+compare-and-swap — and pushes never write objects through it, which would
+break the invariant that a ref is only updated after all of its objects are
+uploaded. Local reads can be disabled by setting the environment variable
+GIT_REMOTE_DROPBOX_NO_LOCAL.
+
 [gitremote-helper]: https://www.kernel.org/pub/software/scm/git/docs/gitremote-helpers.html
 [git-objects]: https://git-scm.com/book/en/v2/Git-Internals-Git-Objects
 [git-references]: https://git-scm.com/book/en/v2/Git-Internals-Git-References

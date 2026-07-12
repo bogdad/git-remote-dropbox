@@ -21,6 +21,7 @@ from git_remote_dropbox.util import (
     Level,
     Poison,
     Token,
+    find_dropbox_roots,
     readline,
     stderr,
     stdout,
@@ -51,6 +52,8 @@ class Helper:
         self._refs: Dict[str, Tuple[str, str]] = {}  # map from remote ref name => (rev number, sha)
         self._pushed: Dict[str, str] = {}  # map from remote ref name => sha
         self._first_push = False
+        self._local_dir_known = False
+        self._local_dir_cached: Optional[str] = None
 
     @property
     def verbosity(self) -> Level:
@@ -264,13 +267,67 @@ class Helper:
         suffix = name[2:]
         return posixpath.join(self._path, "objects", prefix, suffix)
 
+    @property
+    def _local_dir(self) -> Optional[str]:
+        """
+        Return this repository's directory inside a local Dropbox sync
+        folder, or None if there is no such directory on this machine.
+
+        Objects — which are immutable and verified by hash — may be read from
+        this directory instead of being downloaded via the API. Refs must
+        always go through the API: the sync folder can lag behind the server,
+        and ref updates rely on the API's atomic compare-and-swap. Because
+        every local read is hash-verified (with an API fallback on mismatch),
+        a stale or even entirely wrong local folder can never corrupt a
+        fetch. Set GIT_REMOTE_DROPBOX_NO_LOCAL to disable local reads.
+        """
+        if not self._local_dir_known:
+            self._local_dir_known = True
+            if not os.environ.get("GIT_REMOTE_DROPBOX_NO_LOCAL"):
+                relative = self._path.strip("/").split("/")
+                for root in find_dropbox_roots():
+                    candidate = os.path.join(root, *relative)
+                    if os.path.isdir(os.path.join(candidate, "objects")):
+                        self._trace(f"using local dropbox folder: {candidate}")
+                        self._local_dir_cached = candidate
+                        break
+        return self._local_dir_cached
+
+    def _read_local_object(self, sha: str) -> Optional[bytes]:
+        """
+        Read an object's encoded data from the local Dropbox sync folder.
+
+        Return None if there is no local folder or the object is not in it.
+        The Dropbox client materializes online-only placeholder files on
+        read. Callers must verify the hash of the returned data.
+        """
+        local_dir = self._local_dir
+        if local_dir is None:
+            return None
+        path = os.path.join(local_dir, "objects", sha[:2], sha[2:])
+        try:
+            with open(path, "rb") as f:
+                return f.read()
+        except OSError:
+            return None
+
     def _get_object(self, sha: str) -> Tuple[bytes, str, bytes]:
         """
-        Get an object's encoded data.
+        Get an object's encoded data, preferring the local Dropbox folder
+        over the API.
 
         Return a tuple (encoded data, kind, contents); raise if the object
         cannot be obtained or its hash does not match.
         """
+        local = self._read_local_object(sha)
+        if local is not None:
+            try:
+                computed_sha, kind, contents = git.decode_object(local)
+                if computed_sha == sha:
+                    return (local, kind, contents)
+            except Exception:  # noqa: BLE001, S110
+                pass
+            self._trace(f"invalid local copy of {sha}, downloading")
         _, data = self._get_file(self._object_path(sha))
         computed_sha, kind, contents = git.decode_object(data)
         if computed_sha != sha:
@@ -392,7 +449,25 @@ class Helper:
     def _list_remote_object_shas(self) -> List[str]:
         """
         Return the shas of all objects present on the remote.
+
+        If a local Dropbox sync folder is available, list it instead of
+        calling the API: listing directories does not materialize
+        placeholder files, and the result may only lag behind the server,
+        which is harmless — the object graph walk fetches anything newer.
         """
+        local_dir = self._local_dir
+        if local_dir is not None:
+            shas = []
+            objects_dir = os.path.join(local_dir, "objects")
+            for prefix in os.listdir(objects_dir):
+                subdir = os.path.join(objects_dir, prefix)
+                if not os.path.isdir(subdir):
+                    continue
+                for suffix in os.listdir(subdir):
+                    sha = prefix + suffix
+                    if _is_sha(sha):
+                        shas.append(sha)
+            return shas
         loc = posixpath.join(self._path, "objects")
         try:
             res = self._connection.files_list_folder(loc, recursive=True)
