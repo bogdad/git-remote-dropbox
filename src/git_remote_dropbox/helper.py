@@ -7,6 +7,7 @@ import threading
 from typing import Dict, List, NoReturn, Optional, Set, Tuple, Union
 
 import dropbox  # type: ignore
+import requests  # type: ignore  # a dependency of dropbox
 
 from git_remote_dropbox import git
 from git_remote_dropbox.constants import (
@@ -266,8 +267,17 @@ class Helper:
         Return a tuple (revision, content).
         """
         self._trace(f"fetching: {path}")
-        meta, resp = self._connection.files_download(path)
-        return (meta.rev, resp.content)
+        retries = 0
+        while True:
+            try:
+                meta, resp = self._connection.files_download(path)
+            except (dropbox.exceptions.InternalServerError, requests.exceptions.ConnectionError):
+                if retries >= MAX_RETRIES:
+                    raise
+                retries += 1
+                self._trace(f"transient error fetching {path}, retrying")
+            else:
+                return (meta.rev, resp.content)
 
     def _get_files(self, paths: List[str]) -> List[Tuple[str, bytes]]:
         """
@@ -290,8 +300,8 @@ class Helper:
             while True:
                 try:
                     self._connection.files_upload(data, path, mode, strict_conflict=True, mute=True)
-                except dropbox.exceptions.InternalServerError:
-                    self._trace(f"internal server error writing {sha}, retrying")
+                except (dropbox.exceptions.InternalServerError, requests.exceptions.ConnectionError):
+                    self._trace(f"transient error writing {sha}, retrying")
                     if retries < MAX_RETRIES:
                         retries += 1
                     else:
@@ -330,8 +340,8 @@ class Helper:
                         retries += 1
                     else:
                         raise
-                except dropbox.exceptions.InternalServerError:
-                    self._trace(f"internal server error writing {sha}, retrying")
+                except (dropbox.exceptions.InternalServerError, requests.exceptions.ConnectionError):
+                    self._trace(f"transient error writing {sha}, retrying")
                     if retries < MAX_RETRIES:
                         retries += 1
                     else:
