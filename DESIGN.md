@@ -105,6 +105,19 @@ from the object pointed to by the ref, terminating branches of the recursion
 when we reach objects that we already have locally, provided that we have the
 full history from that point on.
 
+The recursive walk discovers a commit's parent only after downloading the
+commit, so its speed is limited by a network round trip per commit, no matter
+how parallel the downloads are. When fetching into an empty repository (e.g.
+when cloning), where we know we need nearly everything, we therefore first
+list the entire `objects` directory and bulk download all missing objects in
+parallel. This may fetch objects that are unreachable from any ref, which git
+ignores. The bulk download is best-effort: the recursive walk still runs
+afterwards (terminating immediately at objects that are already present) and
+remains responsible for completeness. This is safe under concurrent pushes:
+we read refs before listing objects, and a push uploads all objects before
+updating a ref, so the listing is a superset of the objects reachable from
+the refs being fetched.
+
 [gitremote-helper]: https://www.kernel.org/pub/software/scm/git/docs/gitremote-helpers.html
 [git-objects]: https://git-scm.com/book/en/v2/Git-Internals-Git-Objects
 [git-references]: https://git-scm.com/book/en/v2/Git-Internals-Git-References

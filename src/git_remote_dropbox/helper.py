@@ -169,12 +169,22 @@ class Helper:
         """
         Handle the fetch command.
         """
+        shas = []
         while True:
             _, sha, _ = line.split(" ")
-            self._fetch(sha)
+            shas.append(sha)
             line = readline()
             if line == "":
                 break
+        if not git.repository_has_objects():
+            # cloning (or fetching into an empty repository): bulk downloading
+            # all remote objects is much faster than walking the object graph,
+            # which costs a round trip per commit because a commit's parent is
+            # only discovered once the commit is downloaded; the walk below
+            # still runs to guarantee that everything reachable is present
+            self._fetch_all()
+        for sha in shas:
+            self._fetch(sha)
         _write()
 
     def _delete(self, ref: str) -> None:
@@ -371,6 +381,83 @@ class Helper:
                 output_queue.put((obj, git.referenced_objects_from_data(kind, contents)))
             except Exception as e:  # noqa: BLE001
                 output_queue.put(Poison(f"exception while downloading: {e}"))
+
+    def _list_remote_object_shas(self) -> List[str]:
+        """
+        Return the shas of all objects present on the remote.
+        """
+        loc = posixpath.join(self._path, "objects")
+        try:
+            res = self._connection.files_list_folder(loc, recursive=True)
+            entries = res.entries
+            while res.has_more:
+                res = self._connection.files_list_folder_continue(res.cursor)
+                entries.extend(res.entries)
+        except dropbox.exceptions.ApiError as e:
+            if not isinstance(e.error, dropbox.files.ListFolderError):
+                raise
+            return []  # empty repository
+        shas = []
+        for entry in entries:
+            if not isinstance(entry, dropbox.files.FileMetadata):
+                continue
+            # objects are stored as <path>/objects/<sha prefix>/<sha suffix>
+            prefix, suffix = entry.path_lower.split("/")[-2:]
+            sha = prefix + suffix
+            if len(sha) == 40 and all(c in "0123456789abcdef" for c in sha):  # noqa: PLR2004
+                shas.append(sha)
+        return shas
+
+    def _fetch_object(self, sha: str) -> bool:
+        """
+        Download a single object and write it to the local object store.
+
+        Return whether the download succeeded. Failures are not fatal: this is
+        only used for opportunistic bulk fetching (see `_fetch_all`), and the
+        object graph walk in `_fetch` remains responsible for completeness.
+        """
+        try:
+            _, data = self._get_file(self._object_path(sha))
+            computed_sha, _, _ = git.decode_object(data)
+            if computed_sha != sha:
+                self._trace(f"hash mismatch {computed_sha} != {sha}, skipping")
+                return False
+            git.write_loose_object(sha, data)
+        except Exception as e:  # noqa: BLE001
+            self._trace(f"failed to download {sha}, skipping: {e}")
+            return False
+        return True
+
+    def _fetch_all(self) -> None:
+        """
+        Download all objects present on the remote that are missing locally.
+
+        Unlike `_fetch`, this does not walk the object graph, so it fully
+        parallelizes: the graph walk needs a round trip per commit, because a
+        commit's parent is only discovered once the commit is downloaded. It
+        may download objects that are not reachable from any ref (git ignores
+        such loose objects), and it is best-effort: callers must still walk
+        the refs they need (`_fetch`) to guarantee completeness.
+        """
+        self._trace("listing all remote objects", Level.DEBUG)
+        missing = [sha for sha in self._list_remote_object_shas() if not git.object_exists(sha)]
+        if not missing:
+            return
+        try:
+            pool = multiprocessing.pool.ThreadPool(processes=self._processes)
+            res = pool.imap_unordered(Binder(self, "_fetch_object"), missing)
+            total = len(missing)
+            self._trace("", level=Level.INFO, exact=True)
+            for done, _ in enumerate(res, 1):
+                pct = int(float(done) / total * 100)
+                message = f"\rReceiving objects: {pct:3.0f}% ({done}/{total})"
+                if done == total:
+                    message = f"{message}, done.\n"
+                self._trace(message, level=Level.INFO, exact=True)
+        except Exception:
+            if self.verbosity >= Level.DEBUG:
+                raise  # re-raise exception so it prints out a stack trace
+            self._fatal("exception while fetching objects (run with -v for details)\n")
 
     def _fetch(self, sha: str) -> None:
         """

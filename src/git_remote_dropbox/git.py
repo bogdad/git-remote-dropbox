@@ -272,6 +272,17 @@ def referenced_objects_from_data(kind: str, contents: bytes) -> List[str]:
     raise ValueError(msg)
 
 
+def repository_has_objects() -> bool:
+    """
+    Return whether the local repository contains any objects.
+    """
+    counts = {}
+    for line in command_output("count-objects", "-v").splitlines():
+        key, _, value = line.partition(": ")
+        counts[key] = value
+    return int(counts["count"]) > 0 or int(counts["in-pack"]) > 0
+
+
 def get_remote_url(name: str) -> str:
     """
     Return the URL of the given remote.
