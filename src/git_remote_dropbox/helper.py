@@ -1,8 +1,8 @@
 import multiprocessing
 import multiprocessing.dummy
 import multiprocessing.pool
+import os
 import posixpath
-import sys
 import threading
 from typing import Dict, List, NoReturn, Optional, Set, Tuple, Union
 
@@ -11,6 +11,7 @@ import requests  # type: ignore  # a dependency of dropbox
 
 from git_remote_dropbox import git
 from git_remote_dropbox.constants import (
+    BULK_FETCH_THRESHOLD,
     CHUNK_SIZE,
     MAX_RETRIES,
     PROCESSES,
@@ -77,7 +78,10 @@ class Helper:
         Log a fatal error and exit.
         """
         self._trace(message, Level.ERROR)
-        sys.exit(1)
+        # exit without interpreter teardown: daemon worker threads may still
+        # be writing to stderr, and normal teardown aborts (SIGABRT) if it
+        # cannot acquire the stderr buffer lock
+        os._exit(1)
 
     @property
     def _connection(self) -> dropbox.Dropbox:
@@ -169,22 +173,12 @@ class Helper:
         """
         Handle the fetch command.
         """
-        shas = []
         while True:
             _, sha, _ = line.split(" ")
-            shas.append(sha)
+            self._fetch(sha)
             line = readline()
             if line == "":
                 break
-        if not git.repository_has_objects():
-            # cloning (or fetching into an empty repository): bulk downloading
-            # all remote objects is much faster than walking the object graph,
-            # which costs a round trip per commit because a commit's parent is
-            # only discovered once the commit is downloaded; the walk below
-            # still runs to guarantee that everything reachable is present
-            self._fetch_all()
-        for sha in shas:
-            self._fetch(sha)
         _write()
 
     def _delete(self, ref: str) -> None:
@@ -269,6 +263,20 @@ class Helper:
         prefix = name[:2]
         suffix = name[2:]
         return posixpath.join(self._path, "objects", prefix, suffix)
+
+    def _get_object(self, sha: str) -> Tuple[bytes, str, bytes]:
+        """
+        Get an object's encoded data.
+
+        Return a tuple (encoded data, kind, contents); raise if the object
+        cannot be obtained or its hash does not match.
+        """
+        _, data = self._get_file(self._object_path(sha))
+        computed_sha, kind, contents = git.decode_object(data)
+        if computed_sha != sha:
+            msg = f"hash mismatch {computed_sha} != {sha}"
+            raise ValueError(msg)
+        return (data, kind, contents)
 
     def _get_file(self, path: str) -> Tuple[str, bytes]:
         """
@@ -360,27 +368,26 @@ class Helper:
     def _download(
         self,
         input_queue: "Queue[Union[str, Poison]]",
-        output_queue: "Queue[Union[Tuple[str, List[str]], Poison]]",
+        output_queue: "Queue[Tuple[str, Optional[List[str]]]]",
     ) -> None:
         """
         Download files given in input_queue and push results to output_queue.
 
-        Results are tuples of (sha, list of objects referenced by the object).
+        Results are tuples of (sha, list of objects referenced by the object),
+        with None in place of the list if the download failed; the coordinator
+        (`_fetch`) decides whether a failure is fatal.
         """
         while True:
+            obj = input_queue.get()
+            if isinstance(obj, Poison):
+                return
             try:
-                obj = input_queue.get()
-                if isinstance(obj, Poison):
-                    return
-                _, data = self._get_file(self._object_path(obj))
-                computed_sha, kind, contents = git.decode_object(data)
-                if computed_sha != obj:
-                    output_queue.put(Poison(f"hash mismatch {computed_sha} != {obj}"))
-                    continue
+                data, kind, contents = self._get_object(obj)
                 git.write_loose_object(obj, data)
                 output_queue.put((obj, git.referenced_objects_from_data(kind, contents)))
             except Exception as e:  # noqa: BLE001
-                output_queue.put(Poison(f"exception while downloading: {e}"))
+                self._trace(f"error fetching object {obj}: {e}")
+                output_queue.put((obj, None))
 
     def _list_remote_object_shas(self) -> List[str]:
         """
@@ -404,71 +411,49 @@ class Helper:
             # objects are stored as <path>/objects/<sha prefix>/<sha suffix>
             prefix, suffix = entry.path_lower.split("/")[-2:]
             sha = prefix + suffix
-            if len(sha) == 40 and all(c in "0123456789abcdef" for c in sha):  # noqa: PLR2004
+            if _is_sha(sha):
                 shas.append(sha)
         return shas
-
-    def _fetch_object(self, sha: str) -> bool:
-        """
-        Download a single object and write it to the local object store.
-
-        Return whether the download succeeded. Failures are not fatal: this is
-        only used for opportunistic bulk fetching (see `_fetch_all`), and the
-        object graph walk in `_fetch` remains responsible for completeness.
-        """
-        try:
-            _, data = self._get_file(self._object_path(sha))
-            computed_sha, _, _ = git.decode_object(data)
-            if computed_sha != sha:
-                self._trace(f"hash mismatch {computed_sha} != {sha}, skipping")
-                return False
-            git.write_loose_object(sha, data)
-        except Exception as e:  # noqa: BLE001
-            self._trace(f"failed to download {sha}, skipping: {e}")
-            return False
-        return True
-
-    def _fetch_all(self) -> None:
-        """
-        Download all objects present on the remote that are missing locally.
-
-        Unlike `_fetch`, this does not walk the object graph, so it fully
-        parallelizes: the graph walk needs a round trip per commit, because a
-        commit's parent is only discovered once the commit is downloaded. It
-        may download objects that are not reachable from any ref (git ignores
-        such loose objects), and it is best-effort: callers must still walk
-        the refs they need (`_fetch`) to guarantee completeness.
-        """
-        self._trace("listing all remote objects", Level.DEBUG)
-        missing = [sha for sha in self._list_remote_object_shas() if not git.object_exists(sha)]
-        if not missing:
-            return
-        try:
-            pool = multiprocessing.pool.ThreadPool(processes=self._processes)
-            res = pool.imap_unordered(Binder(self, "_fetch_object"), missing)
-            total = len(missing)
-            self._trace("", level=Level.INFO, exact=True)
-            for done, _ in enumerate(res, 1):
-                pct = int(float(done) / total * 100)
-                message = f"\rReceiving objects: {pct:3.0f}% ({done}/{total})"
-                if done == total:
-                    message = f"{message}, done.\n"
-                self._trace(message, level=Level.INFO, exact=True)
-        except Exception:
-            if self.verbosity >= Level.DEBUG:
-                raise  # re-raise exception so it prints out a stack trace
-            self._fatal("exception while fetching objects (run with -v for details)\n")
 
     def _fetch(self, sha: str) -> None:
         """
         Recursively fetch the given object and the objects it references.
+
+        The object graph walk discovers a commit's parent only after
+        downloading the commit, costing a network round trip per commit no
+        matter how parallel the downloads are. To avoid this, when it is clear
+        that a lot of data is missing — the local repository is empty (e.g. on
+        clone), or the walk has already downloaded BULK_FETCH_THRESHOLD
+        objects — all remote objects that are missing locally are enqueued for
+        download, so that downloads proceed at full parallelism. This may
+        download objects that are unreachable from any ref (git ignores such
+        loose objects); download failures are only fatal for objects known to
+        be needed — those reachable from the requested ref — so garbage on the
+        remote (e.g. a partially-uploaded dangling commit from an aborted
+        push, referencing objects that were never uploaded) cannot break the
+        fetch. The walk always runs to completion and remains responsible for
+        guaranteeing that everything reachable is present.
         """
         # have multiple threads downloading in parallel
         queue = [sha]
         pending: Set[str] = set()
         downloaded: Set[str] = set()
+        needed: Set[str] = {sha}  # transitively referenced by the requested ref
+        failed: Set[str] = set()  # failed downloads that were not needed (yet)
         input_queue: Queue[Union[str, Poison]] = Queue()  # requesting downloads
-        output_queue: Queue[Union[Tuple[str, List[str]], Poison]] = Queue()  # completed downloads
+        output_queue: Queue[Tuple[str, Optional[List[str]]]] = Queue()  # completed downloads
+
+        def bulk_enqueue() -> None:
+            self._trace("bulk fetching all missing remote objects")
+            queue.extend(
+                obj
+                for obj in self._list_remote_object_shas()
+                if obj not in downloaded and obj not in pending and not git.object_exists(obj)
+            )
+
+        bulk_done = not git.repository_has_objects()
+        if bulk_done:
+            bulk_enqueue()
         procs = []
         for _ in range(self._processes):
             target = Binder(self, "_download")
@@ -506,17 +491,32 @@ class Helper:
                     input_queue.put(sha)
             else:
                 # process completed download
-                res = output_queue.get()
-                if isinstance(res, Poison):
-                    # _download never puts Poison with an empty message in the output_queue
-                    if res.message is None:
-                        msg = "invalid Poison with no message"
-                        raise ValueError(msg)
-                    self._fatal(res.message)
-                obj, referenced = res
+                obj, referenced = output_queue.get()
                 pending.remove(obj)
+                if referenced is None:
+                    # download failed (see _download for details)
+                    if obj not in needed:
+                        # the object is not (yet) known to be needed, so this
+                        # is not fatal; if it becomes needed later, it is
+                        # retried, and failure is fatal then
+                        self._trace(f"skipping unneeded object {obj}")
+                        failed.add(obj)
+                        continue
+                    self._fatal(f"failed to fetch {obj} (run with -v for details)")
                 downloaded.add(obj)
+                if obj in needed:
+                    needed.update(referenced)
+                    # retry previously-failed downloads that are now needed
+                    for ref_sha in referenced:
+                        if ref_sha in failed:
+                            failed.discard(ref_sha)
+                            queue.append(ref_sha)
                 queue.extend(referenced)
+                if not bulk_done and len(downloaded) >= BULK_FETCH_THRESHOLD:
+                    # this fetch is large enough that listing the remote and
+                    # downloading in bulk beats walking the object graph
+                    bulk_done = True
+                    bulk_enqueue()
                 # show progress
                 done = len(downloaded)
                 total = done + len(pending)
@@ -651,6 +651,13 @@ class Helper:
         ref = ref[len("ref: ") :].rstrip()
         rev = meta.rev
         return (rev, ref)
+
+
+def _is_sha(name: str) -> bool:
+    """
+    Return whether name looks like a full sha1 hex digest.
+    """
+    return len(name) == 40 and all(c in "0123456789abcdef" for c in name)  # noqa: PLR2004
 
 
 def _write(message: Optional[str] = None) -> None:

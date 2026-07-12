@@ -107,16 +107,18 @@ full history from that point on.
 
 The recursive walk discovers a commit's parent only after downloading the
 commit, so its speed is limited by a network round trip per commit, no matter
-how parallel the downloads are. When fetching into an empty repository (e.g.
-when cloning), where we know we need nearly everything, we therefore first
-list the entire `objects` directory and bulk download all missing objects in
-parallel. This may fetch objects that are unreachable from any ref, which git
-ignores. The bulk download is best-effort: the recursive walk still runs
-afterwards (terminating immediately at objects that are already present) and
-remains responsible for completeness. This is safe under concurrent pushes:
-we read refs before listing objects, and a push uploads all objects before
-updating a ref, so the listing is a superset of the objects reachable from
-the refs being fetched.
+how parallel the downloads are. When it is clear that a lot of data is missing
+— the local repository is empty (e.g. when cloning), or the walk has already
+downloaded a threshold number of objects — we therefore list the entire
+`objects` directory and enqueue all objects that are missing locally, so that
+downloads proceed at full parallelism. This may fetch objects that are
+unreachable from any ref, which git ignores; download failures are only fatal
+for objects that the walk discovers are actually needed. The bulk download is
+best-effort: the recursive walk always runs to completion and remains
+responsible for completeness. This is safe under concurrent pushes: we read
+refs before listing objects, and a push uploads all objects before updating a
+ref, so the listing is a superset of the objects reachable from the refs
+being fetched.
 
 [gitremote-helper]: https://www.kernel.org/pub/software/scm/git/docs/gitremote-helpers.html
 [git-objects]: https://git-scm.com/book/en/v2/Git-Internals-Git-Objects
