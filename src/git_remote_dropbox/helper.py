@@ -88,6 +88,7 @@ class Helper:
         self._pushed: Dict[str, str] = {}  # map from remote ref name => sha
         self._first_push = False
         self._local_dir_known = False
+        self._offline_checked = False
         self._local_dir_cached: Optional[str] = None
 
     @property
@@ -325,17 +326,39 @@ class Helper:
                     if os.path.isdir(os.path.join(candidate, "objects")):
                         self._trace(f"using local dropbox folder: {candidate}")
                         self._local_dir_cached = candidate
-                        online, sampled = _sample_online_only(os.path.join(candidate, "objects"))
-                        if sampled and online * 4 >= sampled:  # 25% or more
-                            self._trace(
-                                f"warning: {online} of {sampled} sampled objects in {candidate} are "
-                                "online-only, so reading them is slow (the Dropbox client downloads "
-                                "each one first). Mark the folder 'Make Available Offline' in "
-                                "Finder, or set GIT_REMOTE_DROPBOX_NO_LOCAL=1 to use the API instead.",
-                                level=Level.INFO,
-                            )
                         break
         return self._local_dir_cached
+
+    def _check_local_dir_offline(self) -> None:
+        """
+        Refuse to fetch from a local Dropbox folder whose objects are mostly
+        online-only placeholders.
+
+        Reading a placeholder makes the Dropbox client download it first, one
+        object at a time, which is far slower than the API and can block for
+        a long time with no timeout. Set GIT_REMOTE_DROPBOX_ALLOW_ONLINE_ONLY
+        to warn and carry on anyway, or GIT_REMOTE_DROPBOX_NO_LOCAL to use
+        the API only.
+        """
+        if self._offline_checked:
+            return
+        self._offline_checked = True
+        local_dir = self._local_dir
+        if local_dir is None:
+            return
+        online, sampled = _sample_online_only(os.path.join(local_dir, "objects"))
+        if not sampled or online * 4 < sampled:  # fewer than 25% online-only
+            return
+        message = (
+            f"{online} of {sampled} sampled objects in {local_dir} are online-only, "
+            "so reading them is slow (the Dropbox client downloads each one first). "
+            "Mark the folder 'Make Available Offline' in Finder and wait for it to sync, "
+            "or set GIT_REMOTE_DROPBOX_NO_LOCAL=1 to use the API instead."
+        )
+        if os.environ.get("GIT_REMOTE_DROPBOX_ALLOW_ONLINE_ONLY"):
+            self._trace(f"warning: {message}", level=Level.INFO)
+        else:
+            self._fatal(f"{message} (set GIT_REMOTE_DROPBOX_ALLOW_ONLINE_ONLY=1 to fetch anyway)")
 
     def _read_local_object(self, sha: str) -> Optional[bytes]:
         """
@@ -553,6 +576,7 @@ class Helper:
         fetch. The walk always runs to completion and remains responsible for
         guaranteeing that everything reachable is present.
         """
+        self._check_local_dir_offline()
         # have multiple threads downloading in parallel
         queue = [sha]
         pending: Set[str] = set()
