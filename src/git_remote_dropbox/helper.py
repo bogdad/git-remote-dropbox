@@ -1,3 +1,4 @@
+import io
 import multiprocessing
 import multiprocessing.dummy
 import multiprocessing.pool
@@ -6,6 +7,9 @@ import posixpath
 import queue as queue_module
 import stat
 import threading
+import time
+import zipfile
+from collections import defaultdict
 from typing import Dict, List, NoReturn, Optional, Set, Tuple, Union
 
 import dropbox  # type: ignore
@@ -89,6 +93,7 @@ class Helper:
         self._first_push = False
         self._local_dir_known = False
         self._offline_checked = False
+        self._local_reads = True  # read objects from the local folder; off if it is online-only
         self._local_dir_cached: Optional[str] = None
 
     @property
@@ -331,14 +336,17 @@ class Helper:
 
     def _check_local_dir_offline(self) -> None:
         """
-        Refuse to fetch from a local Dropbox folder whose objects are mostly
-        online-only placeholders.
+        Stop reading objects from a local Dropbox folder whose objects are
+        mostly online-only placeholders.
 
         Reading a placeholder makes the Dropbox client download it first, one
         object at a time, which is far slower than the API and can block for
-        a long time with no timeout. Set GIT_REMOTE_DROPBOX_ALLOW_ONLINE_ONLY
-        to warn and carry on anyway, or GIT_REMOTE_DROPBOX_NO_LOCAL to use
-        the API only.
+        a long time with no timeout. Directory listings are still fine, as
+        they do not materialize files. Missing objects are then fetched with
+        the API instead, in bulk as one zip per object subdirectory (see
+        `_zip_prefetch`). Set GIT_REMOTE_DROPBOX_ALLOW_ONLINE_ONLY to read the
+        placeholders anyway, or GIT_REMOTE_DROPBOX_NO_LOCAL to ignore the
+        local folder entirely.
         """
         if self._offline_checked:
             return
@@ -349,16 +357,105 @@ class Helper:
         online, sampled = _sample_online_only(os.path.join(local_dir, "objects"))
         if not sampled or online * 4 < sampled:  # fewer than 25% online-only
             return
-        message = (
-            f"{online} of {sampled} sampled objects in {local_dir} are online-only, "
-            "so reading them is slow (the Dropbox client downloads each one first). "
-            "Mark the folder 'Make Available Offline' in Finder and wait for it to sync, "
-            "or set GIT_REMOTE_DROPBOX_NO_LOCAL=1 to use the API instead."
-        )
         if os.environ.get("GIT_REMOTE_DROPBOX_ALLOW_ONLINE_ONLY"):
-            self._trace(f"warning: {message}", level=Level.INFO)
-        else:
-            self._fatal(f"{message} (set GIT_REMOTE_DROPBOX_ALLOW_ONLINE_ONLY=1 to fetch anyway)")
+            self._trace(
+                f"warning: {online} of {sampled} sampled objects in {local_dir} are online-only; "
+                "reading them will be slow",
+                level=Level.INFO,
+            )
+            return
+        self._local_reads = False
+        self._trace(
+            f"{online} of {sampled} sampled objects in {local_dir} are online-only; "
+            "downloading via the API instead (mark the folder 'Make Available Offline' "
+            "in Finder to read it locally)",
+            level=Level.INFO,
+        )
+
+    def _zip_prefetch(self, shas: List[str]) -> None:
+        """
+        Best-effort bulk download of the given remote objects.
+
+        Downloads one zip per object subdirectory (at most 256 requests)
+        instead of one request per object, writes each verified object into
+        the local object store, and ignores failures: the object graph walk in
+        `_fetch` downloads anything that is still missing one by one.
+        """
+        by_prefix: Dict[str, Set[str]] = defaultdict(set)
+        for sha in shas:
+            by_prefix[sha[:2]].add(sha[2:])
+        total = len(shas)
+        lock = threading.Lock()
+        done = 0
+        size = 0
+        failed_prefixes: List[str] = []
+        started = time.monotonic()
+
+        def fetch_prefix(prefix: str) -> None:
+            nonlocal done, size
+            wanted = by_prefix[prefix]
+            path = posixpath.join(self._path, "objects", prefix)
+            written = 0
+            received = 0
+            ok = False
+            for attempt in range(MAX_RETRIES):
+                try:
+                    _, resp = self._connection.files_download_zip(path)
+                    try:
+                        content = resp.content
+                    finally:
+                        resp.close()
+                    received = len(content)
+                    with zipfile.ZipFile(io.BytesIO(content)) as archive:
+                        for info in archive.infolist():
+                            suffix = posixpath.basename(info.filename)
+                            if info.is_dir() or suffix not in wanted:
+                                continue
+                            sha = prefix + suffix
+                            data = archive.read(info)
+                            computed_sha, _, _ = git.decode_object(data)
+                            if computed_sha == sha:
+                                git.write_loose_object(sha, data)
+                                written += 1
+                    ok = True
+                    break
+                except (dropbox.exceptions.InternalServerError, requests.exceptions.ConnectionError) as e:
+                    self._trace(f"zip download of {path} failed (attempt {attempt + 1}): {e}", level=Level.INFO)
+                except Exception as e:  # noqa: BLE001
+                    self._trace(f"zip download of {path} failed: {e}", level=Level.INFO)
+                    break
+            with lock:
+                done += written
+                size += received
+                if not ok:
+                    failed_prefixes.append(prefix)
+                self._trace(
+                    f"\rDownloading objects: {int(done * 100 / max(total, 1)):3.0f}% ({done}/{total})",
+                    level=Level.INFO,
+                    exact=True,
+                )
+
+        self._trace(
+            f"downloading {total} missing objects as {len(by_prefix)} zip files "
+            f"({self._processes} in parallel)",
+            level=Level.INFO,
+        )
+        pool = multiprocessing.dummy.Pool(self._processes)
+        try:
+            pool.map(fetch_prefix, sorted(by_prefix))
+        finally:
+            pool.close()
+            pool.join()
+        elapsed = time.monotonic() - started
+        self._trace("", level=Level.INFO, exact=True)
+        self._trace(
+            f"zip download: {done} of {total} objects, {size / 1048576:.1f} MiB in {elapsed:.1f}s "
+            f"({done / max(elapsed, 0.001):.0f} objects/s); {len(failed_prefixes)} of "
+            f"{len(by_prefix)} zips failed"
+            + (f" ({', '.join(sorted(failed_prefixes)[:10])})" if failed_prefixes else "")
+            + ("; the rest will be fetched one by one" if done < total else ""),
+            level=Level.INFO,
+        )
 
     def _read_local_object(self, sha: str) -> Optional[bytes]:
         """
@@ -369,7 +466,7 @@ class Helper:
         read. Callers must verify the hash of the returned data.
         """
         local_dir = self._local_dir
-        if local_dir is None:
+        if local_dir is None or not self._local_reads:
             return None
         path = os.path.join(local_dir, "objects", sha[:2], sha[2:])
         try:
@@ -588,11 +685,16 @@ class Helper:
 
         def bulk_enqueue() -> None:
             self._trace("bulk fetching all missing remote objects")
-            queue.extend(
+            missing = [
                 obj
                 for obj in self._list_remote_object_shas()
                 if obj not in downloaded and obj not in pending and not git.object_exists(obj)
-            )
+            ]
+            if not self._local_reads and missing:
+                # the local folder is online-only: download as zips first
+                self._zip_prefetch(missing)
+                missing = [obj for obj in missing if not git.object_exists(obj)]
+            queue.extend(missing)
 
         bulk_done = not git.repository_has_objects()
         if bulk_done:
