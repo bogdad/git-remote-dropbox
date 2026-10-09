@@ -3,6 +3,8 @@ import multiprocessing.dummy
 import multiprocessing.pool
 import os
 import posixpath
+import queue as queue_module
+import stat
 import threading
 from typing import Dict, List, NoReturn, Optional, Set, Tuple, Union
 
@@ -15,6 +17,8 @@ from git_remote_dropbox.constants import (
     CHUNK_SIZE,
     MAX_RETRIES,
     PROCESSES,
+    STALL_LIMIT,
+    STALL_TIMEOUT,
 )
 from git_remote_dropbox.util import (
     Binder,
@@ -36,6 +40,37 @@ try:
     from multiprocessing import synchronize as _  # noqa: F401
 except ImportError:
     from queue import Queue  # type: ignore
+
+
+def _sample_online_only(objects_dir: str, limit: int = 200) -> Tuple[int, int]:
+    """
+    Sample the object files in a local Dropbox folder and return
+    (number online-only, number sampled).
+
+    Reading an online-only (dataless) placeholder makes the Dropbox client
+    download it first, which is slow. This only works on macOS, where
+    placeholders carry the SF_DATALESS flag; elsewhere it returns (0, 0).
+    """
+    flag = getattr(stat, "SF_DATALESS", 0x40000000)
+    online = sampled = 0
+    try:
+        prefixes = sorted(os.listdir(objects_dir))
+        step = max(1, len(prefixes) // 16)  # spread the sample over the folder
+        for prefix in prefixes[::step]:
+            subdir = os.path.join(objects_dir, prefix)
+            if not os.path.isdir(subdir):
+                continue
+            for name in os.listdir(subdir)[: max(1, limit // 16)]:
+                flags = getattr(os.lstat(os.path.join(subdir, name)), "st_flags", None)
+                if flags is None:
+                    return (0, 0)
+                sampled += 1
+                online += bool(flags & flag)
+            if sampled >= limit:
+                break
+    except OSError:
+        pass
+    return (online, sampled)
 
 
 class Helper:
@@ -290,6 +325,15 @@ class Helper:
                     if os.path.isdir(os.path.join(candidate, "objects")):
                         self._trace(f"using local dropbox folder: {candidate}")
                         self._local_dir_cached = candidate
+                        online, sampled = _sample_online_only(os.path.join(candidate, "objects"))
+                        if sampled and online * 4 >= sampled:  # 25% or more
+                            self._trace(
+                                f"warning: {online} of {sampled} sampled objects in {candidate} are "
+                                "online-only, so reading them is slow (the Dropbox client downloads "
+                                "each one first). Mark the folder 'Make Available Offline' in "
+                                "Finder, or set GIT_REMOTE_DROPBOX_NO_LOCAL=1 to use the API instead.",
+                                level=Level.INFO,
+                            )
                         break
         return self._local_dir_cached
 
@@ -539,7 +583,9 @@ class Helper:
             proc.start()
             procs.append(proc)
         self._trace("", level=Level.INFO, exact=True)  # for showing progress
-        done = total = 0
+        done = total = stalls = 0
+        resuming = False  # set once an already-present object has incomplete history
+        walked: Set[str] = set()  # present objects whose references were already queued
         while queue or pending:
             if queue:
                 # if possible, queue up download
@@ -554,9 +600,16 @@ class Helper:
                         # but `git fsck` will complain if it's not present, so
                         # we explicitly add it to avoid that.
                         git.write_object("tree", b"")
-                    if not git.history_exists(sha):
+                    if sha in walked:
+                        continue
+                    if resuming or not git.history_exists(sha):
                         # this can only happen in the case of aborted fetches
-                        # that are resumed later
+                        # that are resumed later. Checking each commit's
+                        # history costs a git subprocess, so once we know
+                        # we are resuming, just walk the objects we already
+                        # have through the persistent cat-file process.
+                        resuming = True
+                        walked.add(sha)
                         self._trace(f"missing part of history from {sha}")
                         queue.extend(git.referenced_objects(sha))
                     else:
@@ -566,7 +619,24 @@ class Helper:
                     input_queue.put(sha)
             else:
                 # process completed download
-                obj, referenced = output_queue.get()
+                try:
+                    obj, referenced = output_queue.get(timeout=STALL_TIMEOUT)
+                except queue_module.Empty:
+                    stalls += 1
+                    shown = ", ".join(sorted(pending)[:5])
+                    self._trace(
+                        f"\nno download completed for {stalls * STALL_TIMEOUT}s; "
+                        f"{len(pending)} pending, e.g. {shown}",
+                        level=Level.INFO,
+                        exact=True,
+                    )
+                    if stalls >= STALL_LIMIT:
+                        self._fatal(
+                            f"fetch stalled with {len(pending)} objects pending; "
+                            "rerun to resume (already downloaded objects are kept)"
+                        )
+                    continue
+                stalls = 0
                 pending.remove(obj)
                 if referenced is None:
                     # download failed (see _download for details)
